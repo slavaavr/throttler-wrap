@@ -15,10 +15,9 @@ type ThrottlerTransport struct {
 	duration            time.Duration
 	exceptUrlPaths      []string
 	isRetErrOnOverLimit bool
-	whenElapsedCh       <-chan time.Time
 	reqCounter          uint32
 	barrier             *Barrier
-	once                *sync.Once
+	onceCh              chan *sync.Once
 }
 
 const ReqOverLimitError = "you have exceeded requests count"
@@ -27,9 +26,13 @@ func (t *ThrottlerTransport) RoundTrip(req *http.Request) (*http.Response, error
 	if t.reqLimit == 0 || t.isExceptUrlPath(req.URL.Path) {
 		return t.transport.RoundTrip(req)
 	}
-	t.once.Do(func() {
-		go t.updateThrottlerState()
-	})
+	select {
+	case once := <-t.onceCh:
+		once.Do(func() {
+			go t.updateThrottlerState()
+		})
+	default:
+	}
 	if atomic.LoadUint32(&t.reqCounter) == t.reqLimit {
 		if t.isRetErrOnOverLimit {
 			return nil, errors.New(ReqOverLimitError)
@@ -48,7 +51,7 @@ func (t *ThrottlerTransport) updateThrottlerState() {
 	if acquiredCount > 0 {
 		t.updateThrottlerState()
 	} else {
-		t.once = &sync.Once{}
+		t.onceCh <- &sync.Once{}
 	}
 }
 
@@ -98,6 +101,8 @@ func NewThrottler(transport http.RoundTripper, reqLimit uint32, d time.Duration,
 	if resExceptUrlPaths == nil {
 		resExceptUrlPaths = []string{}
 	}
+	onceCh := make(chan *sync.Once, 1)
+	onceCh <- &sync.Once{}
 	return &ThrottlerTransport{
 		transport:           transport,
 		reqLimit:            reqLimit,
@@ -106,7 +111,7 @@ func NewThrottler(transport http.RoundTripper, reqLimit uint32, d time.Duration,
 		isRetErrOnOverLimit: isRetErrOnOverLimit,
 
 		barrier:    NewBarrier(reqLimit),
-		once:       &sync.Once{},
+		onceCh:     onceCh,
 		reqCounter: 0,
 	}
 }
